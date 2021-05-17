@@ -1100,6 +1100,10 @@ if want_libcryptsetup_plugins != 'false' and not skip_deps
         result = cc.run(code, name : 'libcryptsetup plugins check', dependencies : libcryptsetup)
 
         have = result.compiled() and result.returncode() == 0
+
+        if want_libcryptsetup_plugins == 'true' and not have
+                error('libcryptsetup compiled without supporting token plugins.')
+        endif
 else
         have = false
 endif
@@ -1658,6 +1662,7 @@ subdir('src/shared')
 subdir('src/udev')
 subdir('src/libudev')
 subdir('src/cryptsetup/cryptsetup-token-systemd-tpm2')
+subdir('src/cryptsetup/cryptsetup-token-systemd-fido2')
 
 libsystemd = shared_library(
         'systemd',
@@ -1743,6 +1748,18 @@ if conf.get('HAVE_LIBCRYPTSETUP_PLUGINS') == 1
                 link_with : [libshared],
                 link_whole : [cryptsetup_token_systemd_tpm2_static],
                 link_depends : cryptsetup_token_systemd_tpm2_sym,
+                install_rpath : rootlibexecdir,
+                install : true,
+                install_dir : rootlibdir)
+
+        cryptsetup_token_systemd_fido2 = shared_library(
+                'cryptsetup-token-systemd-fido2',
+                link_args : ['-shared',
+                             '-Wl,--version-script=' + cryptsetup_token_systemd_fido2_sym_path],
+                dependencies : libshared_deps + [libcryptsetup],
+                link_with : [libshared],
+                link_whole : [cryptsetup_token_systemd_fido2_static],
+                link_depends : cryptsetup_token_systemd_fido2_sym,
                 install_rpath : rootlibexecdir,
                 install : true,
                 install_dir : rootlibdir)

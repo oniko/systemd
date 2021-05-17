@@ -724,6 +724,104 @@ static int make_security_device_monitor(sd_event *event, sd_device_monitor **ret
         return 0;
 }
 
+#if HAVE_LIBCRYPTSETUP_PLUGINS
+static int acquire_pins_from_env_variable(char ***ret_pins) {
+        char *e;
+        _cleanup_strv_free_erase_ char **pins = NULL;
+
+        e = getenv("PIN");
+        if (e) {
+                pins = strv_new(e);
+                if (!pins)
+                        return log_oom();
+
+                string_erase(e);
+                if (unsetenv("PIN") < 0)
+                        return log_error_errno(errno, "Failed to unset $PIN: %m");
+        }
+
+        *ret_pins = TAKE_PTR(pins);
+
+        return 0;
+}
+
+static int attach_luks2_by_fido2(
+                struct crypt_device *cd,
+                const char *name,
+                int token_id,
+                usec_t until,
+                bool headless,
+                void *usrptr,
+                uint32_t activation_flags) {
+
+        int r;
+        char **p;
+        _cleanup_strv_free_erase_ char **pins = NULL;
+        AskPasswordFlags flags = ASK_PASSWORD_PUSH_CACHE | ASK_PASSWORD_ACCEPT_CACHED;
+
+        /* May happen only if libcryptsetup gets recompiled with --disable-external-tokens for
+         * some reason. */
+        if (crypt_token_external_support() < 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Libcryptsetup does not support loading external plugins.");
+
+        r = crypt_activate_by_token_pin(cd, name, "systemd-fido2", token_id, NULL, 0, usrptr, activation_flags);
+        if (r > 0) /* returns unlocked keyslot id on success */
+                r = 0;
+        if (r != -ENOANO) /* needs pin */
+        // if (!IN_SET(r, -ENOANO, -EPERM))
+                return r;
+
+        r = acquire_pins_from_env_variable(&pins);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(p, pins) {
+                r = crypt_activate_by_token_pin(cd, name, "systemd-fido2", token_id, *p, strlen(*p), usrptr, activation_flags);
+                if (r > 0) /* returns unlocked keyslot id on success */
+                        r = 0;
+                if (r != -EPERM)
+                        return r;
+        }
+
+        if (headless)
+                return log_error_errno(SYNTHETIC_ERRNO(ENOPKG), "PIN querying disabled via 'headless' option. Use the '$PIN' environment variable.");
+
+        pins = strv_free_erase(pins);
+        r = ask_password_auto("Please enter security token PIN:", "drive-harddisk", NULL, "fido2-pin", "cryptsetup.fido2-pin", until, flags, &pins);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(p, pins) {
+                r = crypt_activate_by_token_pin(cd, name, "systemd-fido2", token_id, *p, strlen(*p), usrptr, activation_flags);
+                if (r > 0) /* returns unlocked keyslot id on success */
+                        r = 0;
+                if (r != -EPERM)
+                        return r;
+        }
+
+        r = -EPERM;
+
+        flags &= ~ASK_PASSWORD_ACCEPT_CACHED;
+        for (;;) {
+                pins = strv_free_erase(pins);
+                r = ask_password_auto("Please enter security token PIN:", "drive-harddisk", NULL, "fido2-pin", "cryptsetup.fido2-pin", until, flags, &pins);
+                if (r < 0)
+                        return r;
+
+                STRV_FOREACH(p, pins) {
+                        r = crypt_activate_by_token_pin(cd, name, "systemd-fido2", token_id, *p, strlen(*p), usrptr, activation_flags);
+                        if (r > 0) /* returns unlocked keyslot id on success */
+                                r = 0;
+                        if (r != -EPERM)
+                                return r;
+                }
+        }
+
+        return r;
+}
+#endif
+
 static int attach_luks_or_plain_or_bitlk_by_fido2(
                 struct crypt_device *cd,
                 const char *name,
@@ -738,7 +836,10 @@ static int attach_luks_or_plain_or_bitlk_by_fido2(
         _cleanup_(erase_and_freep) void *decrypted_key = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_free_ void *discovered_salt = NULL, *discovered_cid = NULL;
-        size_t discovered_salt_size, discovered_cid_size, cid_size, decrypted_key_size;
+        size_t cid_size, decrypted_key_size;
+#if ! HAVE_LIBCRYPTSETUP_PLUGINS
+        size_t discovered_salt_size, discovered_cid_size;
+#endif
         _cleanup_free_ char *friendly = NULL, *discovered_rp_id = NULL;
         int keyslot = arg_key_slot, r;
         const char *rp_id;
@@ -759,7 +860,9 @@ static int attach_luks_or_plain_or_bitlk_by_fido2(
                 cid_size = arg_fido2_cid_size;
 
                 required = FIDO2ENROLL_PIN | FIDO2ENROLL_UP; /* For backwards compatibility, PIN+presence is required by default. */
-        } else {
+        }
+#if ! HAVE_LIBCRYPTSETUP_PLUGINS
+          else {
                 r = find_fido2_auto_data(
                                 cd,
                                 &discovered_rp_id,
@@ -786,6 +889,7 @@ static int attach_luks_or_plain_or_bitlk_by_fido2(
                 cid = discovered_cid;
                 cid_size = discovered_cid_size;
         }
+#endif
 
         friendly = friendly_disk_name(crypt_get_device_name(cd), name);
         if (!friendly)
@@ -793,7 +897,14 @@ static int attach_luks_or_plain_or_bitlk_by_fido2(
 
         for (;;) {
                 bool processed = false;
-
+#if HAVE_LIBCRYPTSETUP_PLUGINS
+                if (!arg_fido2_cid) {
+                        r = attach_luks2_by_fido2(cd, name, CRYPT_ANY_TOKEN, until, arg_headless, arg_fido2_device, flags);
+                        if (r == -EAGAIN) /* EAGAIN means: token not found */
+                                goto wait_for_token;
+                        return r;
+                }
+#endif
                 r = acquire_fido2_key(
                                 name,
                                 friendly,
@@ -811,6 +922,9 @@ static int attach_luks_or_plain_or_bitlk_by_fido2(
                 if (r != -EAGAIN) /* EAGAIN means: token not found */
                         return r;
 
+#if HAVE_LIBCRYPTSETUP_PLUGINS
+wait_for_token:
+#endif
                 if (!monitor) {
                         /* We didn't find the token. In this case, watch for it via udev. Let's
                          * create an event loop and monitor first. */
